@@ -7,9 +7,17 @@
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <vector>
+#include <string>
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
 #include "..\..\Common\Network\NetworkPlayerInterface.h"
 
 #pragma comment(lib, "Ws2_32.lib")
+
+struct HttpResponse {
+	int status;
+	std::string body;
+};
 
 #define WIN64_NET_DEFAULT_PORT 25565
 #define WIN64_NET_MAX_CLIENTS 7
@@ -65,8 +73,16 @@ public:
 	static bool Initialize();
 	static void Shutdown();
 
+	static std::string GetAccessToken() { return s_accessToken; }
+	static std::string GetUserId() { return s_userId; }
+
+	static void SetCustomHostAddress(const std::string& ip, int port);
+
+
 	static bool HostGame(int port, const char* bindIp = NULL);
 	static bool JoinGame(const char* ip, int port);
+
+	static HttpResponse DoWinHttpRequest(const wchar_t* host, int port, const std::wstring& path, const wchar_t* method, const std::string& requestData, const std::vector<std::wstring>& headers);
 
 	static bool SendToSmallId(BYTE targetSmallId, const void* data, int dataSize);
 	static bool SendOnSocket(SOCKET sock, const void* data, int dataSize);
@@ -103,6 +119,12 @@ private:
 	static DWORD WINAPI ClientRecvThreadProc(LPVOID param);
 	static DWORD WINAPI AdvertiseThreadProc(LPVOID param);
 	static DWORD WINAPI DiscoveryThreadProc(LPVOID param);
+
+	static std::string s_accessToken;
+	static std::string s_userId;
+
+	static std::string s_customHostIp;
+	static int s_customHostPort;
 
 	static SOCKET s_listenSocket;
 	static SOCKET s_hostConnectionSocket;

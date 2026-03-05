@@ -9,10 +9,69 @@
 #include "..\..\Common\Network\PlatformNetworkManagerStub.h"
 #include "..\..\..\Minecraft.World\Socket.h"
 
+#include "json.hpp"
+
+#include "..\Windows64_Launcher.h"
+
+HttpResponse WinsockNetLayer::DoWinHttpRequest(const wchar_t* host, int port, const std::wstring& path, const wchar_t* method, const std::string& requestData, const std::vector<std::wstring>& headers)
+{
+	HttpResponse response;
+	response.status = 0;
+
+	HINTERNET hSession = WinHttpOpen(L"Minecraft Client", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (!hSession) return response;
+
+	HINTERNET hConnect = WinHttpConnect(hSession, host, port, 0);
+	if (!hConnect) { WinHttpCloseHandle(hSession); return response; }
+
+	HINTERNET hRequest = WinHttpOpenRequest(hConnect, method, path.c_str(), NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+	if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); return response; }
+
+	for (const auto& header : headers) {
+		WinHttpAddRequestHeaders(hRequest, header.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+	}
+
+	BOOL bResults = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, (LPVOID)requestData.c_str(), (DWORD)requestData.size(), (DWORD)requestData.size(), 0);
+	if (bResults) bResults = WinHttpReceiveResponse(hRequest, NULL);
+
+	if (bResults) {
+		DWORD dwStatusCode = 0;
+		DWORD dwSize = sizeof(dwStatusCode);
+		WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &dwStatusCode, &dwSize, WINHTTP_NO_HEADER_INDEX);
+		response.status = dwStatusCode;
+
+		DWORD dwDownloaded = 0;
+		do {
+			dwSize = 0;
+			if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
+			if (dwSize == 0) break;
+			char* pszOutBuffer = new char[dwSize + 1];
+			if (!pszOutBuffer) break;
+			ZeroMemory(pszOutBuffer, dwSize + 1);
+			if (WinHttpReadData(hRequest, (LPVOID)pszOutBuffer, dwSize, &dwDownloaded)) {
+				response.body.append(pszOutBuffer, dwDownloaded);
+			}
+			delete[] pszOutBuffer;
+		} while (dwSize > 0);
+	}
+
+	WinHttpCloseHandle(hRequest);
+	WinHttpCloseHandle(hConnect);
+	WinHttpCloseHandle(hSession);
+
+	return response;
+}
+
 SOCKET WinsockNetLayer::s_listenSocket = INVALID_SOCKET;
 SOCKET WinsockNetLayer::s_hostConnectionSocket = INVALID_SOCKET;
 HANDLE WinsockNetLayer::s_acceptThread = NULL;
 HANDLE WinsockNetLayer::s_clientRecvThread = NULL;
+
+std::string WinsockNetLayer::s_accessToken = "";
+std::string WinsockNetLayer::s_userId = "";
+
+std::string WinsockNetLayer::s_customHostIp = "";
+int WinsockNetLayer::s_customHostPort = 0;
 
 bool WinsockNetLayer::s_isHost = false;
 bool WinsockNetLayer::s_connected = false;
@@ -54,6 +113,12 @@ char g_Win64MultiplayerIP[256] = "127.0.0.1";
 bool g_Win64DedicatedServer = false;
 int g_Win64DedicatedServerPort = WIN64_NET_DEFAULT_PORT;
 char g_Win64DedicatedServerBindIP[256] = "";
+
+void WinsockNetLayer::SetCustomHostAddress(const std::string& ip, int port)
+{
+	s_customHostIp = ip;
+	s_customHostPort = port;
+}
 
 bool WinsockNetLayer::Initialize()
 {
@@ -162,19 +227,17 @@ bool WinsockNetLayer::HostGame(int port, const char* bindIp)
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_protocol = IPPROTO_TCP;
-	hints.ai_flags = (bindIp == NULL || bindIp[0] == 0) ? AI_PASSIVE : 0;
+
+	std::string relayIp = s_customHostIp.empty() ? "127.0.0.1" : s_customHostIp;
+	int relayPort = s_customHostPort == 0 ? 25565 : s_customHostPort;
 
 	char portStr[16];
-	sprintf_s(portStr, "%d", port);
+	sprintf_s(portStr, "%d", relayPort);
 
-	const char* resolvedBindIp = (bindIp != NULL && bindIp[0] != 0) ? bindIp : NULL;
-	int iResult = getaddrinfo(resolvedBindIp, portStr, &hints, &result);
+	int iResult = getaddrinfo(relayIp.c_str(), portStr, &hints, &result);
 	if (iResult != 0)
 	{
-		app.DebugPrintf("getaddrinfo failed for %s:%d - %d\n",
-			resolvedBindIp != NULL ? resolvedBindIp : "*",
-			port,
-			iResult);
+		app.DebugPrintf("getaddrinfo failed for Relay Server %s:%d - %d\n", relayIp.c_str(), relayPort, iResult);
 		return false;
 	}
 
@@ -186,53 +249,39 @@ bool WinsockNetLayer::HostGame(int port, const char* bindIp)
 		return false;
 	}
 
-	int opt = 1;
-	setsockopt(s_listenSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+	int noDelay = 1;
+	setsockopt(s_listenSocket, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
 
-	iResult = ::bind(s_listenSocket, result->ai_addr, (int)result->ai_addrlen);
+	iResult = connect(s_listenSocket, result->ai_addr, (int)result->ai_addrlen);
 	freeaddrinfo(result);
 	if (iResult == SOCKET_ERROR)
 	{
-		app.DebugPrintf("bind() failed: %d\n", WSAGetLastError());
+		app.DebugPrintf("connect() to Relay Server %s:%d failed: %d\n", relayIp.c_str(), relayPort, WSAGetLastError());
 		closesocket(s_listenSocket);
 		s_listenSocket = INVALID_SOCKET;
 		return false;
 	}
 
-	iResult = listen(s_listenSocket, SOMAXCONN);
-	if (iResult == SOCKET_ERROR)
-	{
-		app.DebugPrintf("listen() failed: %d\n", WSAGetLastError());
-		closesocket(s_listenSocket);
-		s_listenSocket = INVALID_SOCKET;
-		return false;
-	}
+	extern char g_Win64Username[17];
+	std::string req = "HOST " + std::string(g_Win64Username) + "\n";
+	send(s_listenSocket, req.c_str(), (int)req.length(), 0);
 
 	s_active = true;
 	s_connected = true;
 
 	s_acceptThread = CreateThread(NULL, 0, AcceptThreadProc, NULL, 0, NULL);
 
-	app.DebugPrintf("Win64 LAN: Hosting on %s:%d\n",
-		resolvedBindIp != NULL ? resolvedBindIp : "*",
-		port);
+	app.DebugPrintf("Win64 LAN: Hosting via Cloud Relay at %s:%d (Session: %s)\n", relayIp.c_str(), relayPort, g_Win64Username);
 	return true;
 }
 
 bool WinsockNetLayer::JoinGame(const char* ip, int port)
 {
+	// NOTE: 'ip' parameter acts as the Session ID (Owner ID) in the Relay Architecture!
 	if (!s_initialized && !Initialize()) return false;
 
 	s_isHost = false;
 	s_hostSmallId = 0;
-	s_connected = false;
-	s_active = false;
-
-	if (s_hostConnectionSocket != INVALID_SOCKET)
-	{
-		closesocket(s_hostConnectionSocket);
-		s_hostConnectionSocket = INVALID_SOCKET;
-	}
 
 	struct addrinfo hints = {};
 	struct addrinfo* result = NULL;
@@ -241,67 +290,56 @@ bool WinsockNetLayer::JoinGame(const char* ip, int port)
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_protocol = IPPROTO_TCP;
 
-	char portStr[16];
-	sprintf_s(portStr, "%d", port);
+	std::string relayIp = s_customHostIp.empty() ? "127.0.0.1" : s_customHostIp;
+	int relayPort = s_customHostPort == 0 ? 25565 : s_customHostPort;
 
-	int iResult = getaddrinfo(ip, portStr, &hints, &result);
+	char portStr[16];
+	sprintf_s(portStr, "%d", relayPort);
+
+	int iResult = getaddrinfo(relayIp.c_str(), portStr, &hints, &result);
 	if (iResult != 0)
 	{
-		app.DebugPrintf("getaddrinfo failed for %s:%d - %d\n", ip, port, iResult);
+		app.DebugPrintf("getaddrinfo failed for Relay Server %s:%d - %d\n", relayIp.c_str(), relayPort, iResult);
 		return false;
 	}
 
-	bool connected = false;
-	BYTE assignedSmallId = 0;
-	const int maxAttempts = 12;
-
-	for (int attempt = 0; attempt < maxAttempts; ++attempt)
+	s_hostConnectionSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+	if (s_hostConnectionSocket == INVALID_SOCKET)
 	{
-		s_hostConnectionSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
-		if (s_hostConnectionSocket == INVALID_SOCKET)
-		{
-			app.DebugPrintf("socket() failed: %d\n", WSAGetLastError());
-			break;
-		}
-
-		int noDelay = 1;
-		setsockopt(s_hostConnectionSocket, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
-
-		iResult = connect(s_hostConnectionSocket, result->ai_addr, (int)result->ai_addrlen);
-		if (iResult == SOCKET_ERROR)
-		{
-			int err = WSAGetLastError();
-			app.DebugPrintf("connect() to %s:%d failed (attempt %d/%d): %d\n", ip, port, attempt + 1, maxAttempts, err);
-			closesocket(s_hostConnectionSocket);
-			s_hostConnectionSocket = INVALID_SOCKET;
-			Sleep(200);
-			continue;
-		}
-
-		BYTE assignBuf[1];
-		int bytesRecv = recv(s_hostConnectionSocket, (char*)assignBuf, 1, 0);
-		if (bytesRecv != 1)
-		{
-			app.DebugPrintf("Failed to receive small ID assignment from host (attempt %d/%d)\n", attempt + 1, maxAttempts);
-			closesocket(s_hostConnectionSocket);
-			s_hostConnectionSocket = INVALID_SOCKET;
-			Sleep(200);
-			continue;
-		}
-
-		assignedSmallId = assignBuf[0];
-		connected = true;
-		break;
+		app.DebugPrintf("socket() failed: %d\n", WSAGetLastError());
+		freeaddrinfo(result);
+		return false;
 	}
+
+	int noDelay = 1;
+	setsockopt(s_hostConnectionSocket, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
+
+	iResult = connect(s_hostConnectionSocket, result->ai_addr, (int)result->ai_addrlen);
 	freeaddrinfo(result);
-
-	if (!connected)
+	if (iResult == SOCKET_ERROR)
 	{
+		app.DebugPrintf("connect() to Relay Server %s:%d failed: %d\n", relayIp.c_str(), relayPort, WSAGetLastError());
+		closesocket(s_hostConnectionSocket);
+		s_hostConnectionSocket = INVALID_SOCKET;
 		return false;
 	}
-	s_localSmallId = assignedSmallId;
 
-	app.DebugPrintf("Win64 LAN: Connected to %s:%d, assigned smallId=%d\n", ip, port, s_localSmallId);
+	std::string hostname(ip);
+	std::string req = "JOIN " + hostname + "\n";
+	send(s_hostConnectionSocket, req.c_str(), (int)req.length(), 0);
+
+	BYTE assignBuf[1];
+	int bytesRecv = recv(s_hostConnectionSocket, (char*)assignBuf, 1, 0);
+	if (bytesRecv != 1)
+	{
+		app.DebugPrintf("Failed to receive small ID assignment from host\n");
+		closesocket(s_hostConnectionSocket);
+		s_hostConnectionSocket = INVALID_SOCKET;
+		return false;
+	}
+	s_localSmallId = assignBuf[0];
+
+	app.DebugPrintf("Win64 LAN: Connected via Relay to Session %s, assigned smallId=%d\n", ip, s_localSmallId);
 
 	s_active = true;
 	s_connected = true;
@@ -419,85 +457,147 @@ void WinsockNetLayer::HandleDataReceived(BYTE fromSmallId, BYTE toSmallId, unsig
 
 DWORD WINAPI WinsockNetLayer::AcceptThreadProc(LPVOID param)
 {
+	char buf[256];
 	while (s_active)
 	{
-		SOCKET clientSocket = accept(s_listenSocket, NULL, NULL);
-		if (clientSocket == INVALID_SOCKET)
+		int ret = recv(s_listenSocket, buf, sizeof(buf) - 1, 0);
+		if (ret <= 0)
 		{
 			if (s_active)
-				app.DebugPrintf("accept() failed: %d\n", WSAGetLastError());
+				app.DebugPrintf("Relay Server control socket disconnected.\n");
 			break;
 		}
+		buf[ret] = 0;
 
-		int noDelay = 1;
-		setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
-
-		extern QNET_STATE _iQNetStubState;
-		if (_iQNetStubState != QNET_STATE_GAME_PLAY)
+		std::string str(buf);
+		size_t pos = 0;
+		while ((pos = str.find('\n')) != std::string::npos)
 		{
-			app.DebugPrintf("Win64 LAN: Rejecting connection, game not ready\n");
-			closesocket(clientSocket);
-			continue;
+			std::string line = str.substr(0, pos);
+			str.erase(0, pos + 1);
+
+			if (line.find("CLIENT ") == 0)
+			{
+				std::string clientId = line.substr(7);
+
+				struct addrinfo hints = {};
+				struct addrinfo* result = NULL;
+
+				hints.ai_family = AF_INET;
+				hints.ai_socktype = SOCK_STREAM;
+				hints.ai_protocol = IPPROTO_TCP;
+
+				std::string relayIp = s_customHostIp.empty() ? "127.0.0.1" : s_customHostIp;
+				int relayPort = s_customHostPort == 0 ? 25565 : s_customHostPort;
+				char portStr[16];
+				sprintf_s(portStr, "%d", relayPort);
+
+				int iResult = getaddrinfo(relayIp.c_str(), portStr, &hints, &result);
+				if (iResult != 0) continue;
+
+				SOCKET clientSocket = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+				if (clientSocket == INVALID_SOCKET) { freeaddrinfo(result); continue; }
+
+				int noDelay = 1;
+				setsockopt(clientSocket, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
+
+				iResult = connect(clientSocket, result->ai_addr, (int)result->ai_addrlen);
+				freeaddrinfo(result);
+				if (iResult == SOCKET_ERROR)
+				{
+					closesocket(clientSocket);
+					continue;
+				}
+
+				extern char g_Win64Username[17];
+				std::string acc = "ACCEPT " + std::string(g_Win64Username) + " " + clientId + "\n";
+				send(clientSocket, acc.c_str(), (int)acc.length(), 0);
+
+				extern QNET_STATE _iQNetStubState;
+				if (_iQNetStubState != QNET_STATE_GAME_PLAY && _iQNetStubState != QNET_STATE_SESSION_HOSTING && _iQNetStubState != QNET_STATE_SESSION_STARTING)
+				{
+					app.DebugPrintf("Win64 LAN: Rejecting connection, game not ready\n");
+					closesocket(clientSocket);
+					continue;
+				}
+
+				BYTE assignedSmallId;
+				EnterCriticalSection(&s_freeSmallIdLock);
+				if (!s_freeSmallIds.empty())
+				{
+					assignedSmallId = s_freeSmallIds.back();
+					s_freeSmallIds.pop_back();
+				}
+				else if (s_nextSmallId < MINECRAFT_NET_MAX_PLAYERS)
+				{
+					assignedSmallId = s_nextSmallId++;
+				}
+				else
+				{
+					LeaveCriticalSection(&s_freeSmallIdLock);
+					app.DebugPrintf("Win64 LAN: Server full, rejecting connection\n");
+					closesocket(clientSocket);
+					continue;
+				}
+				LeaveCriticalSection(&s_freeSmallIdLock);
+
+				BYTE assignBuf[1] = { assignedSmallId };
+				int sent = send(clientSocket, (const char*)assignBuf, 1, 0);
+				if (sent != 1)
+				{
+					app.DebugPrintf("Failed to send small ID to client\n");
+					closesocket(clientSocket);
+					PushFreeSmallId(assignedSmallId);
+					continue;
+				}
+
+				// If an old slot for this smallId somehow remains, retire it before reusing the id.
+				EnterCriticalSection(&s_connectionsLock);
+				for (size_t i = 0; i < s_connections.size(); i++)
+				{
+					if (s_connections[i].smallId == assignedSmallId)
+					{
+						s_connections[i].active = false;
+						if (s_connections[i].tcpSocket != INVALID_SOCKET)
+						{
+							closesocket(s_connections[i].tcpSocket);
+							s_connections[i].tcpSocket = INVALID_SOCKET;
+						}
+					}
+				}
+				LeaveCriticalSection(&s_connectionsLock);
+
+				Win64RemoteConnection conn;
+				conn.tcpSocket = clientSocket;
+				conn.smallId = assignedSmallId;
+				conn.active = true;
+				conn.recvThread = NULL;
+
+				EnterCriticalSection(&s_connectionsLock);
+				s_connections.push_back(conn);
+				int connIdx = (int)s_connections.size() - 1;
+				LeaveCriticalSection(&s_connectionsLock);
+
+				app.DebugPrintf("Win64 LAN: Client connected via Relay, assigned smallId=%d\n", assignedSmallId);
+
+				IQNetPlayer* qnetPlayer = &IQNet::m_player[assignedSmallId];
+
+				extern void Win64_SetupRemoteQNetPlayer(IQNetPlayer * player, BYTE smallId, bool isHost, bool isLocal);
+				Win64_SetupRemoteQNetPlayer(qnetPlayer, assignedSmallId, false, false);
+
+				extern CPlatformNetworkManagerStub* g_pPlatformNetworkManager;
+				g_pPlatformNetworkManager->NotifyPlayerJoined(qnetPlayer);
+
+				DWORD* threadParam = new DWORD;
+				*threadParam = connIdx;
+				HANDLE hThread = CreateThread(NULL, 0, RecvThreadProc, threadParam, 0, NULL);
+
+				EnterCriticalSection(&s_connectionsLock);
+				if (connIdx < (int)s_connections.size())
+					s_connections[connIdx].recvThread = hThread;
+				LeaveCriticalSection(&s_connectionsLock);
+			}
 		}
-
-		BYTE assignedSmallId;
-		EnterCriticalSection(&s_freeSmallIdLock);
-		if (!s_freeSmallIds.empty())
-		{
-			assignedSmallId = s_freeSmallIds.back();
-			s_freeSmallIds.pop_back();
-		}
-		else if (s_nextSmallId < MINECRAFT_NET_MAX_PLAYERS)
-		{
-			assignedSmallId = s_nextSmallId++;
-		}
-		else
-		{
-			LeaveCriticalSection(&s_freeSmallIdLock);
-			app.DebugPrintf("Win64 LAN: Server full, rejecting connection\n");
-			closesocket(clientSocket);
-			continue;
-		}
-		LeaveCriticalSection(&s_freeSmallIdLock);
-
-		BYTE assignBuf[1] = { assignedSmallId };
-		int sent = send(clientSocket, (const char*)assignBuf, 1, 0);
-		if (sent != 1)
-		{
-			app.DebugPrintf("Failed to send small ID to client\n");
-			closesocket(clientSocket);
-			continue;
-		}
-
-		Win64RemoteConnection conn;
-		conn.tcpSocket = clientSocket;
-		conn.smallId = assignedSmallId;
-		conn.active = true;
-		conn.recvThread = NULL;
-
-		EnterCriticalSection(&s_connectionsLock);
-		s_connections.push_back(conn);
-		int connIdx = (int)s_connections.size() - 1;
-		LeaveCriticalSection(&s_connectionsLock);
-
-		app.DebugPrintf("Win64 LAN: Client connected, assigned smallId=%d\n", assignedSmallId);
-
-		IQNetPlayer* qnetPlayer = &IQNet::m_player[assignedSmallId];
-
-		extern void Win64_SetupRemoteQNetPlayer(IQNetPlayer * player, BYTE smallId, bool isHost, bool isLocal);
-		Win64_SetupRemoteQNetPlayer(qnetPlayer, assignedSmallId, false, false);
-
-		extern CPlatformNetworkManagerStub* g_pPlatformNetworkManager;
-		g_pPlatformNetworkManager->NotifyPlayerJoined(qnetPlayer);
-
-		DWORD* threadParam = new DWORD;
-		*threadParam = connIdx;
-		HANDLE hThread = CreateThread(NULL, 0, RecvThreadProc, threadParam, 0, NULL);
-
-		EnterCriticalSection(&s_connectionsLock);
-		if (connIdx < (int)s_connections.size())
-			s_connections[connIdx].recvThread = hThread;
-		LeaveCriticalSection(&s_connectionsLock);
 	}
 	return 0;
 }
@@ -517,8 +617,7 @@ DWORD WINAPI WinsockNetLayer::RecvThreadProc(LPVOID param)
 	BYTE clientSmallId = s_connections[connIdx].smallId;
 	LeaveCriticalSection(&s_connectionsLock);
 
-	std::vector<BYTE> recvBuf;
-	recvBuf.resize(WIN64_NET_RECV_BUFFER_SIZE);
+	BYTE* recvBuf = new BYTE[WIN64_NET_RECV_BUFFER_SIZE];
 
 	while (s_active)
 	{
@@ -529,51 +628,40 @@ DWORD WINAPI WinsockNetLayer::RecvThreadProc(LPVOID param)
 			break;
 		}
 
-		int packetSize =
-			((uint32_t)header[0] << 24) |
-			((uint32_t)header[1] << 16) |
-			((uint32_t)header[2] << 8) |
-			((uint32_t)header[3]);
+		int packetSize = (header[0] << 24) | (header[1] << 16) | (header[2] << 8) | header[3];
 
-		if (packetSize <= 0 || packetSize > WIN64_NET_MAX_PACKET_SIZE)
+		if (packetSize <= 0 || packetSize > WIN64_NET_RECV_BUFFER_SIZE)
 		{
-			app.DebugPrintf("Win64 LAN: Invalid packet size %d from client smallId=%d (max=%d)\n",
-				packetSize,
-				clientSmallId,
-				(int)WIN64_NET_MAX_PACKET_SIZE);
+			app.DebugPrintf("Win64 LAN: Invalid packet size %d from client smallId=%d\n", packetSize, clientSmallId);
 			break;
 		}
 
-		if ((int)recvBuf.size() < packetSize)
-		{
-			recvBuf.resize(packetSize);
-			app.DebugPrintf("Win64 LAN: Resized host recv buffer to %d bytes for client smallId=%d\n", packetSize, clientSmallId);
-		}
-
-		if (!RecvExact(sock, &recvBuf[0], packetSize))
+		if (!RecvExact(sock, recvBuf, packetSize))
 		{
 			app.DebugPrintf("Win64 LAN: Client smallId=%d disconnected (body)\n", clientSmallId);
 			break;
 		}
 
-		HandleDataReceived(clientSmallId, s_hostSmallId, &recvBuf[0], packetSize);
+		HandleDataReceived(clientSmallId, s_hostSmallId, recvBuf, packetSize);
 	}
 
+	delete[] recvBuf;
+
 	EnterCriticalSection(&s_connectionsLock);
-	for (size_t i = 0; i < s_connections.size(); i++)
+	if (connIdx < (DWORD)s_connections.size())
 	{
-		if (s_connections[i].smallId == clientSmallId)
+		s_connections[connIdx].active = false;
+		if (s_connections[connIdx].tcpSocket != INVALID_SOCKET)
 		{
-			s_connections[i].active = false;
-			if (s_connections[i].tcpSocket != INVALID_SOCKET)
-			{
-				closesocket(s_connections[i].tcpSocket);
-				s_connections[i].tcpSocket = INVALID_SOCKET;
-			}
-			break;
+			closesocket(s_connections[connIdx].tcpSocket);
+			s_connections[connIdx].tcpSocket = INVALID_SOCKET;
 		}
 	}
 	LeaveCriticalSection(&s_connectionsLock);
+
+	// Return this id immediately so rapid reconnect attempts don't exhaust the id pool
+	// while the game thread catches up with disconnect processing.
+	PushFreeSmallId(clientSmallId);
 
 	EnterCriticalSection(&s_disconnectLock);
 	s_disconnectedSmallIds.push_back(clientSmallId);
@@ -621,8 +709,7 @@ void WinsockNetLayer::CloseConnectionBySmallId(BYTE smallId)
 
 DWORD WINAPI WinsockNetLayer::ClientRecvThreadProc(LPVOID param)
 {
-	std::vector<BYTE> recvBuf;
-	recvBuf.resize(WIN64_NET_RECV_BUFFER_SIZE);
+	BYTE* recvBuf = new BYTE[WIN64_NET_RECV_BUFFER_SIZE];
 
 	while (s_active && s_hostConnectionSocket != INVALID_SOCKET)
 	{
@@ -635,35 +722,29 @@ DWORD WINAPI WinsockNetLayer::ClientRecvThreadProc(LPVOID param)
 
 		int packetSize = (header[0] << 24) | (header[1] << 16) | (header[2] << 8) | header[3];
 
-		if (packetSize <= 0 || packetSize > WIN64_NET_MAX_PACKET_SIZE)
+		if (packetSize <= 0 || packetSize > WIN64_NET_RECV_BUFFER_SIZE)
 		{
-			app.DebugPrintf("Win64 LAN: Invalid packet size %d from host (max=%d)\n",
-				packetSize,
-				(int)WIN64_NET_MAX_PACKET_SIZE);
+			app.DebugPrintf("Win64 LAN: Invalid packet size %d from host\n", packetSize);
 			break;
 		}
 
-		if ((int)recvBuf.size() < packetSize)
-		{
-			recvBuf.resize(packetSize);
-			app.DebugPrintf("Win64 LAN: Resized client recv buffer to %d bytes\n", packetSize);
-		}
-
-		if (!RecvExact(s_hostConnectionSocket, &recvBuf[0], packetSize))
+		if (!RecvExact(s_hostConnectionSocket, recvBuf, packetSize))
 		{
 			app.DebugPrintf("Win64 LAN: Disconnected from host (body)\n");
 			break;
 		}
 
-		HandleDataReceived(s_hostSmallId, s_localSmallId, &recvBuf[0], packetSize);
+		HandleDataReceived(s_hostSmallId, s_localSmallId, recvBuf, packetSize);
 	}
 
-	s_connected = false;
+	delete[] recvBuf;
+
 	return 0;
 }
 
 bool WinsockNetLayer::StartAdvertising(int gamePort, const wchar_t* hostName, unsigned int gameSettings, unsigned int texPackId, unsigned char subTexId, unsigned short netVer)
 {
+
 	if (s_advertising) return true;
 	if (!s_initialized) return false;
 
@@ -682,20 +763,10 @@ bool WinsockNetLayer::StartAdvertising(int gamePort, const wchar_t* hostName, un
 	s_hostGamePort = gamePort;
 	LeaveCriticalSection(&s_advertiseLock);
 
-	s_advertiseSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (s_advertiseSock == INVALID_SOCKET)
-	{
-		app.DebugPrintf("Win64 LAN: Failed to create advertise socket: %d\n", WSAGetLastError());
-		return false;
-	}
-
-	BOOL broadcast = TRUE;
-	setsockopt(s_advertiseSock, SOL_SOCKET, SO_BROADCAST, (const char*)&broadcast, sizeof(broadcast));
-
 	s_advertising = true;
 	s_advertiseThread = CreateThread(NULL, 0, AdvertiseThreadProc, NULL, 0, NULL);
 
-	app.DebugPrintf("Win64 LAN: Started advertising on UDP port %d\n", WIN64_LAN_DISCOVERY_PORT);
+	app.DebugPrintf("Win64 LAN: Started advertising on Supabase\n");
 	return true;
 }
 
@@ -722,6 +793,8 @@ void WinsockNetLayer::UpdateAdvertisePlayerCount(BYTE count)
 	EnterCriticalSection(&s_advertiseLock);
 	s_advertiseData.playerCount = count;
 	LeaveCriticalSection(&s_advertiseLock);
+
+	// Player count is tracked by the relay server automatically
 }
 
 void WinsockNetLayer::UpdateAdvertiseJoinable(bool joinable)
@@ -733,29 +806,12 @@ void WinsockNetLayer::UpdateAdvertiseJoinable(bool joinable)
 
 DWORD WINAPI WinsockNetLayer::AdvertiseThreadProc(LPVOID param)
 {
-	struct sockaddr_in broadcastAddr;
-	memset(&broadcastAddr, 0, sizeof(broadcastAddr));
-	broadcastAddr.sin_family = AF_INET;
-	broadcastAddr.sin_port = htons(WIN64_LAN_DISCOVERY_PORT);
-	broadcastAddr.sin_addr.s_addr = INADDR_BROADCAST;
-
+	// No-op: The relay server automatically tracks hosts via the control socket.
+	// When the HOST control socket closes, the relay removes the session.
 	while (s_advertising)
 	{
-		EnterCriticalSection(&s_advertiseLock);
-		Win64LANBroadcast data = s_advertiseData;
-		LeaveCriticalSection(&s_advertiseLock);
-
-		int sent = sendto(s_advertiseSock, (const char*)&data, sizeof(data), 0,
-			(struct sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
-
-		if (sent == SOCKET_ERROR && s_advertising)
-		{
-			app.DebugPrintf("Win64 LAN: Broadcast sendto failed: %d\n", WSAGetLastError());
-		}
-
-		Sleep(1000);
+		Sleep(5000);
 	}
-
 	return 0;
 }
 
@@ -764,37 +820,10 @@ bool WinsockNetLayer::StartDiscovery()
 	if (s_discovering) return true;
 	if (!s_initialized) return false;
 
-	s_discoverySock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (s_discoverySock == INVALID_SOCKET)
-	{
-		app.DebugPrintf("Win64 LAN: Failed to create discovery socket: %d\n", WSAGetLastError());
-		return false;
-	}
-
-	BOOL reuseAddr = TRUE;
-	setsockopt(s_discoverySock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuseAddr, sizeof(reuseAddr));
-
-	struct sockaddr_in bindAddr;
-	memset(&bindAddr, 0, sizeof(bindAddr));
-	bindAddr.sin_family = AF_INET;
-	bindAddr.sin_port = htons(WIN64_LAN_DISCOVERY_PORT);
-	bindAddr.sin_addr.s_addr = INADDR_ANY;
-
-	if (::bind(s_discoverySock, (struct sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR)
-	{
-		app.DebugPrintf("Win64 LAN: Discovery bind failed: %d\n", WSAGetLastError());
-		closesocket(s_discoverySock);
-		s_discoverySock = INVALID_SOCKET;
-		return false;
-	}
-
-	DWORD timeout = 500;
-	setsockopt(s_discoverySock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-
 	s_discovering = true;
 	s_discoveryThread = CreateThread(NULL, 0, DiscoveryThreadProc, NULL, 0, NULL);
 
-	app.DebugPrintf("Win64 LAN: Listening for LAN games on UDP port %d\n", WIN64_LAN_DISCOVERY_PORT);
+	app.DebugPrintf("Win64 LAN: Started discovering servers via Relay\n");
 	return true;
 }
 
@@ -831,87 +860,108 @@ std::vector<Win64LANSession> WinsockNetLayer::GetDiscoveredSessions()
 
 DWORD WINAPI WinsockNetLayer::DiscoveryThreadProc(LPVOID param)
 {
-	char recvBuf[512];
-
 	while (s_discovering)
 	{
-		struct sockaddr_in senderAddr;
-		int senderLen = sizeof(senderAddr);
+		// Connect to relay and send LIST command
+		struct addrinfo hints = {};
+		struct addrinfo* result = NULL;
 
-		int recvLen = recvfrom(s_discoverySock, recvBuf, sizeof(recvBuf), 0,
-			(struct sockaddr*)&senderAddr, &senderLen);
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_protocol = IPPROTO_TCP;
 
-		if (recvLen == SOCKET_ERROR)
+		std::string relayIp = s_customHostIp.empty() ? "127.0.0.1" : s_customHostIp;
+		int relayPort = s_customHostPort == 0 ? 25565 : s_customHostPort;
+		char portStr[16];
+		sprintf_s(portStr, "%d", relayPort);
+
+		int iResult = getaddrinfo(relayIp.c_str(), portStr, &hints, &result);
+		if (iResult != 0)
 		{
+			Sleep(5000);
 			continue;
 		}
 
-		if (recvLen < (int)sizeof(Win64LANBroadcast))
-			continue;
+		SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+		if (sock == INVALID_SOCKET) { freeaddrinfo(result); Sleep(5000); continue; }
 
-		Win64LANBroadcast* broadcast = (Win64LANBroadcast*)recvBuf;
-		if (broadcast->magic != WIN64_LAN_BROADCAST_MAGIC)
-			continue;
-
-		char senderIP[64];
-		inet_ntop(AF_INET, &senderAddr.sin_addr, senderIP, sizeof(senderIP));
-
-		DWORD now = GetTickCount();
-
-		EnterCriticalSection(&s_discoveryLock);
-
-		bool found = false;
-		for (size_t i = 0; i < s_discoveredSessions.size(); i++)
+		iResult = connect(sock, result->ai_addr, (int)result->ai_addrlen);
+		freeaddrinfo(result);
+		if (iResult == SOCKET_ERROR)
 		{
-			if (strcmp(s_discoveredSessions[i].hostIP, senderIP) == 0 &&
-				s_discoveredSessions[i].hostPort == (int)broadcast->gamePort)
+			closesocket(sock);
+			Sleep(5000);
+			continue;
+		}
+
+		// Send LIST command
+		const char* listCmd = "LIST\n";
+		send(sock, listCmd, (int)strlen(listCmd), 0);
+
+		// Receive JSON response
+		char recvBuf[4096];
+		std::string jsonStr;
+		while (true)
+		{
+			int ret = recv(sock, recvBuf, sizeof(recvBuf) - 1, 0);
+			if (ret <= 0) break;
+			recvBuf[ret] = 0;
+			jsonStr += recvBuf;
+			if (jsonStr.find('\n') != std::string::npos) break;
+		}
+		closesocket(sock);
+
+		// Trim trailing newline
+		while (!jsonStr.empty() && (jsonStr.back() == '\n' || jsonStr.back() == '\r'))
+			jsonStr.pop_back();
+
+		if (!jsonStr.empty())
+		{
+			try
 			{
-				s_discoveredSessions[i].netVersion = broadcast->netVersion;
-				wcsncpy_s(s_discoveredSessions[i].hostName, 32, broadcast->hostName, _TRUNCATE);
-				s_discoveredSessions[i].playerCount = broadcast->playerCount;
-				s_discoveredSessions[i].maxPlayers = broadcast->maxPlayers;
-				s_discoveredSessions[i].gameHostSettings = broadcast->gameHostSettings;
-				s_discoveredSessions[i].texturePackParentId = broadcast->texturePackParentId;
-				s_discoveredSessions[i].subTexturePackId = broadcast->subTexturePackId;
-				s_discoveredSessions[i].isJoinable = (broadcast->isJoinable != 0);
-				s_discoveredSessions[i].lastSeenTick = now;
-				found = true;
-				break;
+				auto json_array = nlohmann::json::parse(jsonStr);
+				DWORD now = GetTickCount();
+
+				EnterCriticalSection(&s_discoveryLock);
+				s_discoveredSessions.clear();
+
+				for (auto& el : json_array)
+				{
+					std::string sessionId = el["sessionId"];
+					std::string hostName = el["hostName"];
+					int currPlayers = el["playerCount"];
+					int maxPlayers = el["maxPlayers"];
+
+					Win64LANSession session = {};
+					strncpy_s(session.hostIP, sizeof(session.hostIP), sessionId.c_str(), _TRUNCATE);
+					session.hostPort = relayPort;
+
+					MultiByteToWideChar(CP_UTF8, 0, hostName.c_str(), -1, session.hostName, 32);
+
+					session.playerCount = currPlayers;
+					session.maxPlayers = maxPlayers;
+					session.isJoinable = true;
+					session.lastSeenTick = now;
+					session.netVersion = MINECRAFT_NET_VERSION;
+					session.gameHostSettings = 0;
+					session.texturePackParentId = 0;
+					session.subTexturePackId = 0;
+
+					s_discoveredSessions.push_back(session);
+
+					app.DebugPrintf("Win64 ONLINE: Discovered game \"%s\" (session: %s, %d/%d players)\n",
+						hostName.c_str(), sessionId.c_str(), currPlayers, maxPlayers);
+				}
+
+				LeaveCriticalSection(&s_discoveryLock);
+			}
+			catch (const std::exception& e)
+			{
+				app.DebugPrintf("Win64 ONLINE: Failed to parse discovery JSON: %s\n", e.what());
 			}
 		}
 
-		if (!found)
-		{
-			Win64LANSession session;
-			memset(&session, 0, sizeof(session));
-			strncpy_s(session.hostIP, sizeof(session.hostIP), senderIP, _TRUNCATE);
-			session.hostPort = (int)broadcast->gamePort;
-			session.netVersion = broadcast->netVersion;
-			wcsncpy_s(session.hostName, 32, broadcast->hostName, _TRUNCATE);
-			session.playerCount = broadcast->playerCount;
-			session.maxPlayers = broadcast->maxPlayers;
-			session.gameHostSettings = broadcast->gameHostSettings;
-			session.texturePackParentId = broadcast->texturePackParentId;
-			session.subTexturePackId = broadcast->subTexturePackId;
-			session.isJoinable = (broadcast->isJoinable != 0);
-			session.lastSeenTick = now;
-			s_discoveredSessions.push_back(session);
-
-			app.DebugPrintf("Win64 LAN: Discovered game \"%ls\" at %s:%d\n",
-				session.hostName, session.hostIP, session.hostPort);
-		}
-
-		for (size_t i = s_discoveredSessions.size(); i > 0; i--)
-		{
-			if (now - s_discoveredSessions[i - 1].lastSeenTick > 5000)
-			{
-				app.DebugPrintf("Win64 LAN: Session \"%ls\" at %s timed out\n",
-					s_discoveredSessions[i - 1].hostName, s_discoveredSessions[i - 1].hostIP);
-				s_discoveredSessions.erase(s_discoveredSessions.begin() + (i - 1));
-			}
-		}
-
-		LeaveCriticalSection(&s_discoveryLock);
+		Sleep(5000); // 5 sec interval
 	}
 
 	return 0;
