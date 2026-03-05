@@ -14,6 +14,7 @@ CConsoleMinecraftApp app;
 
 CConsoleMinecraftApp::CConsoleMinecraftApp() : CMinecraftApp()
 {
+	m_bShutdown = false;
 }
 
 void CConsoleMinecraftApp::SetRichPresenceContext(int iPad, int contextId)
@@ -26,8 +27,7 @@ void CConsoleMinecraftApp::StoreLaunchData()
 }
 void CConsoleMinecraftApp::ExitGame()
 {
-	extern HWND g_hWnd;
-	PostMessage(g_hWnd, WM_CLOSE, 0, 0);
+	m_bShutdown = true;
 }
 void CConsoleMinecraftApp::FatalLoadError()
 {
@@ -35,9 +35,27 @@ void CConsoleMinecraftApp::FatalLoadError()
 
 void CConsoleMinecraftApp::CaptureSaveThumbnail()
 {
+	RenderManager.CaptureThumbnail(&m_ThumbnailBuffer);
 }
 void CConsoleMinecraftApp::GetSaveThumbnail(PBYTE *pbData,DWORD *pdwSize)
 {
+	// On a save caused by a create world, the thumbnail capture won't have happened
+	if (m_ThumbnailBuffer.Allocated())
+	{
+		if (pbData)
+		{
+			*pbData  = new BYTE[m_ThumbnailBuffer.GetBufferSize()];
+			*pdwSize = m_ThumbnailBuffer.GetBufferSize();
+			memcpy(*pbData, m_ThumbnailBuffer.GetBufferPointer(), *pdwSize);
+		}
+		m_ThumbnailBuffer.Release();
+	}
+	else
+	{
+		// No capture happened (e.g. first save on world creation) leave thumbnail as NULL
+		if (pbData)  *pbData  = NULL;
+		if (pdwSize) *pdwSize = 0;
+	}
 }
 void CConsoleMinecraftApp::ReleaseSaveThumbnail()
 {
